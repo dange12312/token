@@ -12,8 +12,8 @@ from telegram.error import TelegramError
 
 # === CONFIG ===
 MONITORED_WALLET = os.environ.get("MONITORED_WALLET", "7rtiKSUDLBm59b1SBmD9oajcP8xE64vAGSMbAN5CXy1q")
-TELEGRAM_BOT_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN", "8015586375:AAE9RwP1Lzqqob0yJt5DxcidgAlW8LpsYp4")
-TELEGRAM_USER_ID = int(os.environ.get("TELEGRAM_USER_ID", "7683338204"))
+TELEGRAM_BOT_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN", "your_telegram_bot_token")
+TELEGRAM_USER_ID = int(os.environ.get("TELEGRAM_USER_ID", "your_user_id"))
 
 SOLANA_RPC_WS = "wss://api.mainnet-beta.solana.com"
 RPC_HTTP_URL = "https://api.mainnet-beta.solana.com"
@@ -30,7 +30,7 @@ semaphore = asyncio.Semaphore(5)
 async def root():
     return {"status": "ok"}
 
-# === HELPER ===
+# === ALERT ===
 async def send_telegram_alert(mint_address: str, amount: int, signature: str):
     try:
         message = (
@@ -44,7 +44,7 @@ async def send_telegram_alert(mint_address: str, amount: int, signature: str):
     except TelegramError as e:
         logger.error("Telegram error: %s", str(e))
 
-# === MINT DETECTION ===
+# === MONITOR ===
 async def monitor_wallet():
     while True:
         try:
@@ -75,19 +75,17 @@ async def monitor_wallet():
                     value = result.get("value", {})
                     tx_signature = value.get("signature")
                     if not tx_signature:
-                        logger.warning("Log without signature: %s", value)
                         continue
 
-                    # Avoid spamming
-                    await asyncio.sleep(0.5)
+                    await asyncio.sleep(0.3)
                     asyncio.create_task(inspect_transaction(tx_signature))
         except Exception as e:
             logger.exception("Error in monitor_wallet: %s", str(e))
             await asyncio.sleep(5)
 
+# === INSPECT TX ===
 async def inspect_transaction(signature: str):
     if not signature:
-        logger.warning("inspect_transaction called with empty signature")
         return
 
     async with semaphore:
@@ -101,6 +99,7 @@ async def inspect_transaction(signature: str):
             }
             async with httpx.AsyncClient() as client:
                 resp = await client.post(RPC_HTTP_URL, headers=headers, json=body, timeout=10.0)
+
             if resp.status_code != 200:
                 logger.warning("Solana RPC returned %s for tx %s", resp.status_code, signature)
                 return
@@ -115,25 +114,44 @@ async def inspect_transaction(signature: str):
             if not tx:
                 return
 
+            found = False
+
+            # Check top-level instructions for new token account creation
+            instructions = tx.get("transaction", {}).get("message", {}).get("instructions", [])
+            for ix in instructions:
+                if isinstance(ix, dict):
+                    accounts = ix.get("accounts", [])
+                    if any(MONITORED_WALLET in str(acc) for acc in accounts):
+                        logger.info("Detected token account creation in tx %s", signature)
+                        await send_telegram_alert("(Possible New Mint)", 0, signature)
+                        found = True
+                        break
+
+            # Check inner instructions for spl-token mints
             meta = tx.get("meta", {})
             inner_instructions = meta.get("innerInstructions", [])
             for inner in inner_instructions:
                 for ix in inner.get("instructions", []):
                     if ix.get("program") != "spl-token":
                         continue
-                    if ix.get("parsed", {}).get("type") != "mintTo":
+                    parsed = ix.get("parsed", {})
+                    if parsed.get("type") != "mintTo":
                         continue
-                    info = ix.get("parsed", {}).get("info", {})
+                    info = parsed.get("info", {})
                     if info.get("to") != MONITORED_WALLET:
                         continue
-
                     mint = info.get("mint")
                     amount = int(info.get("amount", 0))
                     await send_telegram_alert(mint, amount, signature)
+                    found = True
+
+            if not found:
+                logger.info("No actionable instructions found in tx %s", signature)
+
         except Exception as e:
             logger.exception("Error inspecting transaction %s: %s", signature, str(e))
 
-# === RUN BOTH ===
+# === SERVER & START ===
 def start_fastapi():
     port = int(os.environ.get("PORT", 8000))
     uvicorn.run(app, host="0.0.0.0", port=port)
@@ -144,4 +162,4 @@ def start_monitor():
 if __name__ == "__main__":
     threading.Thread(target=start_fastapi, daemon=True).start()
     start_monitor()
-            
+    
