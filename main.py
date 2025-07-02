@@ -6,15 +6,17 @@ import threading
 from fastapi import FastAPI
 import uvicorn
 import websockets
+import httpx
 from telegram import Bot
 from telegram.error import TelegramError
 
 # === CONFIG ===
-MONITORED_WALLET = "7rtiKSUDLBm59b1SBmD9oajcP8xE64vAGSMbAN5CXy1q"
-TELEGRAM_BOT_TOKEN = "8015586375:AAE9RwP1Lzqqob0yJt5DxcidgAlW8LpsYp4"
-TELEGRAM_USER_ID = 7683338204
+MONITORED_WALLET = os.environ.get("MONITORED_WALLET", "7rtiKSUDLBm59b1SBmD9oajcP8xE64vAGSMbAN5CXy1q")
+TELEGRAM_BOT_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN", "8015586375:AAE9RwP1Lzqqob0yJt5DxcidgAlW8LpsYp4")
+TELEGRAM_USER_ID = int(os.environ.get("TELEGRAM_USER_ID", "7683338204"))
 
 SOLANA_RPC_WS = "wss://api.mainnet-beta.solana.com"
+RPC_HTTP_URL = "https://api.mainnet-beta.solana.com"
 
 # === SETUP ===
 logging.basicConfig(level=logging.INFO)
@@ -22,6 +24,7 @@ logger = logging.getLogger(__name__)
 
 app = FastAPI()
 bot = Bot(token=TELEGRAM_BOT_TOKEN)
+semaphore = asyncio.Semaphore(5)
 
 @app.get("/")
 async def root():
@@ -31,19 +34,18 @@ async def root():
 async def send_telegram_alert(mint_address: str, amount: int, signature: str):
     try:
         message = (
-            f"\u2728 *New SPL Token Mint Detected* \u2728\n"
+            f"✨ *New SPL Token Mint Detected* ✨\n"
             f"\n*Mint:* `{mint_address}`"
             f"\n*Amount:* {amount}"
             f"\n[View on Solscan](https://solscan.io/tx/{signature})"
         )
         await bot.send_message(chat_id=TELEGRAM_USER_ID, text=message, parse_mode="Markdown")
-        logger.info("Alert sent for %s", signature)
+        logger.info("Alert sent for tx %s: mint %s amount %s", signature, mint_address, amount)
     except TelegramError as e:
         logger.error("Telegram error: %s", str(e))
 
 # === MINT DETECTION ===
 async def monitor_wallet():
-    subscription_id = None
     while True:
         try:
             async with websockets.connect(SOLANA_RPC_WS) as ws:
@@ -61,65 +63,75 @@ async def monitor_wallet():
 
                 while True:
                     raw_msg = await ws.recv()
-                    msg = json.loads(raw_msg)
-
-                    if "result" in msg and "id" in msg:
-                        subscription_id = msg["result"]
+                    try:
+                        msg = json.loads(raw_msg)
+                    except json.JSONDecodeError:
+                        logger.warning("Received non-JSON message: %s", raw_msg)
                         continue
 
-                    if "method" not in msg or msg["method"] != "logsNotification":
+                    if msg.get("method") != "logsNotification":
                         continue
 
                     logs = msg.get("params", {}).get("result", {})
                     tx_signature = logs.get("signature")
-                    await asyncio.sleep(0.5)  # Avoid rate limiting
-                    await inspect_transaction(tx_signature)
-        
+                    if not tx_signature:
+                        logger.warning("Log without signature: %s", logs)
+                        continue
+
+                    # Avoid spamming
+                    await asyncio.sleep(0.5)
+                    asyncio.create_task(inspect_transaction(tx_signature))
         except Exception as e:
             logger.exception("Error in monitor_wallet: %s", str(e))
             await asyncio.sleep(5)
 
-async def inspect_transaction(signature):
-    try:
-        url = "https://api.mainnet-beta.solana.com"
-        headers = {"Content-Type": "application/json"}
-        body = {
-            "jsonrpc": "2.0",
-            "id": 1,
-            "method": "getTransaction",
-            "params": [signature, {"encoding": "json", "maxSupportedTransactionVersion": 0}]
-        }
+async def inspect_transaction(signature: str):
+    if not signature:
+        logger.warning("inspect_transaction called with empty signature")
+        return
 
-        async with asyncio.Semaphore(5):  # Limit concurrent calls
-            reader, writer = await asyncio.open_connection("api.mainnet-beta.solana.com", 443, ssl=True)
-            writer.write((json.dumps(body) + "\n").encode())
-            await writer.drain()
-            response = await reader.read(65536)
-            writer.close()
-            await writer.wait_closed()
+    async with semaphore:
+        try:
+            headers = {"Content-Type": "application/json"}
+            body = {
+                "jsonrpc": "2.0",
+                "id": 1,
+                "method": "getTransaction",
+                "params": [signature, {"encoding": "json", "maxSupportedTransactionVersion": 0}]
+            }
+            async with httpx.AsyncClient() as client:
+                resp = await client.post(RPC_HTTP_URL, headers=headers, json=body, timeout=10.0)
+            if resp.status_code != 200:
+                logger.warning("Solana RPC returned %s for tx %s", resp.status_code, signature)
+                return
 
-        resp_json = json.loads(response.decode())
-        tx = resp_json.get("result", {})
-        if not tx:
-            return
+            try:
+                resp_json = resp.json()
+            except json.JSONDecodeError as e:
+                logger.error("Invalid JSON from Solana RPC for tx %s: %s", signature, e)
+                return
 
-        meta = tx.get("meta", {})
-        inner_instructions = meta.get("innerInstructions", [])
-        for inner in inner_instructions:
-            for ix in inner.get("instructions", []):
-                if ix.get("program") != "spl-token":
-                    continue
-                if ix.get("parsed", {}).get("type") != "mintTo":
-                    continue
-                info = ix.get("parsed", {}).get("info", {})
-                if info.get("to") != MONITORED_WALLET:
-                    continue
+            tx = resp_json.get("result")
+            if not tx:
+                return
 
-                mint = info.get("mint")
-                amount = int(info.get("amount", 0))
-                await send_telegram_alert(mint, amount, signature)
-    except Exception as e:
-        logger.exception("Error inspecting transaction %s: %s", signature, str(e))
+            meta = tx.get("meta", {})
+            inner_instructions = meta.get("innerInstructions", [])
+            for inner in inner_instructions:
+                for ix in inner.get("instructions", []):
+                    if ix.get("program") != "spl-token":
+                        continue
+                    if ix.get("parsed", {}).get("type") != "mintTo":
+                        continue
+                    info = ix.get("parsed", {}).get("info", {})
+                    if info.get("to") != MONITORED_WALLET:
+                        continue
+
+                    mint = info.get("mint")
+                    amount = int(info.get("amount", 0))
+                    await send_telegram_alert(mint, amount, signature)
+        except Exception as e:
+            logger.exception("Error inspecting transaction %s: %s", signature, str(e))
 
 # === RUN BOTH ===
 def start_fastapi():
@@ -132,3 +144,4 @@ def start_monitor():
 if __name__ == "__main__":
     threading.Thread(target=start_fastapi, daemon=True).start()
     start_monitor()
+                               
