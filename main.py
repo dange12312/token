@@ -61,8 +61,7 @@ async def monitor_wallet():
                 await ws.send(json.dumps(sub_request))
                 logger.info("Subscribed to logs for wallet: %s", MONITORED_WALLET)
 
-                while True:
-                    raw_msg = await ws.recv()
+                async for raw_msg in ws:
                     try:
                         msg = json.loads(raw_msg)
                     except json.JSONDecodeError:
@@ -72,10 +71,11 @@ async def monitor_wallet():
                     if msg.get("method") != "logsNotification":
                         continue
 
-                    logs = msg.get("params", {}).get("result", {})
-                    tx_signature = logs.get("signature")
+                    result = msg.get("params", {}).get("result", {})
+                    value = result.get("value", {})
+                    tx_signature = value.get("signature")
                     if not tx_signature:
-                        logger.warning("Log without signature: %s", logs)
+                        logger.warning("Log without signature: %s", value)
                         continue
 
                     # Avoid spamming
@@ -144,4 +144,4 @@ def start_monitor():
 if __name__ == "__main__":
     threading.Thread(target=start_fastapi, daemon=True).start()
     start_monitor()
-                               
+            
