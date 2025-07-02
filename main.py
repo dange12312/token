@@ -12,8 +12,8 @@ from telegram.error import TelegramError
 
 # === CONFIG ===
 MONITORED_WALLET = os.environ.get("MONITORED_WALLET", "7rtiKSUDLBm59b1SBmD9oajcP8xE64vAGSMbAN5CXy1q")
-TELEGRAM_BOT_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN", "your_telegram_bot_token")
-TELEGRAM_USER_ID = int(os.environ.get("TELEGRAM_USER_ID", "your_user_id"))
+TELEGRAM_BOT_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN", "7743232071:AAFeRJbJGbbyYrcg3v2BKsuVVRgj17Eat-c")
+TELEGRAM_USER_ID = int(os.environ.get("TELEGRAM_USER_ID", "7683338204"))
 
 SOLANA_RPC_WS = "wss://api.mainnet-beta.solana.com"
 RPC_HTTP_URL = "https://api.mainnet-beta.solana.com"
