@@ -91,13 +91,17 @@ async def listen_transactions():
                 notify_telegram(message)
                 print(f"[{timestamp()}] ✉️ Alert: {wallet} -{outflow:.2f} USDC")
 
-# ─── Combined Run Forever Task ───────────────────────────────────────────
+# ─── Combined Run Forever Task with Alerts ────────────────────────────────
 async def run_forever():
+    # Notify bot start
+    notify_telegram("🤖 USDC Monitor Bot has started and is now monitoring outflows.")
     delay = 1
     while True:
         try:
             await listen_transactions()
         except Exception as err:
+            # Notify bot error/stop
+            notify_telegram(f"⚠️ USDC Monitor Bot encountered an error and stopped: {err}")
             print(f"[{timestamp()}] 🔁 Error: {err} — retrying in {delay}s")
             await asyncio.sleep(delay)
             delay = min(delay * 2, 60)
