@@ -2,11 +2,15 @@ import json
 import asyncio
 import requests
 import websockets
+import threading
+import os
+from fastapi import FastAPI
+import uvicorn
 from datetime import datetime, timezone
 
-# ─── Configuration & Globals ─────────────────────────────────────────────────────
-BOT_TOKEN = "7757376408:AAFn99qPZNSGtfRZsskOVvV4L_LoWJyYJx4"
-USER_ID = "7757376408"
+# ─── Configuration & Globals ─────────────────────────────────────────────
+BOT_TOKEN = "8015586375:AAE9RwP1Lzqqob0yJt5DxcidgAlW8LpsYp4"
+USER_ID = "7683338204"
 
 # Monitor USDC token balances in associated token accounts
 WALLETS = [
@@ -21,8 +25,14 @@ THRESHOLD = int(100 * 1e6)
 subs = {}
 balances = {}
 
-# ─── Utility Functions ────────────────────────────────────────────────
+# ─── FastAPI Setup (Open Port) ────────────────────────────────────────────
+app = FastAPI()
 
+@app.get("/")
+async def root():
+    return {"status": "ok"}
+
+# ─── Utility Functions ───────────────────────────────────────────────────
 def timestamp():
     return datetime.now(timezone.utc).isoformat()
 
@@ -33,7 +43,7 @@ def notify_telegram(message):
     if res.status_code != 200:
         print(f"[{timestamp()}] ⚠️ Telegram error:", res.text)
 
-# ─── Wallet Subscription + Monitoring ──────────────────────────────────────────
+# ─── Wallet Subscription + Monitoring ────────────────────────────────────
 async def subscribe_wallets(ws):
     for i, wallet in enumerate(WALLETS, 1):
         req = {
@@ -62,7 +72,6 @@ async def listen_transactions():
             sub_id = params["subscription"]
             wallet = subs.get(sub_id)
             info = params["result"]["value"]["data"]["parsed"]["info"]
-            # current token amount (raw)
             amount = int(info.get("tokenAmount", {}).get("amount", 0))
 
             if balances[wallet] is None:
@@ -72,7 +81,6 @@ async def listen_transactions():
             diff = amount - balances[wallet]
             balances[wallet] = amount
 
-            # detect outflow > 100 USDC
             if diff < 0 and abs(diff) >= THRESHOLD:
                 outflow = abs(diff) / 1e6
                 message = (
@@ -83,7 +91,7 @@ async def listen_transactions():
                 notify_telegram(message)
                 print(f"[{timestamp()}] ✉️ Alert: {wallet} -{outflow:.2f} USDC")
 
-# ─── Combined Run Forever Task ────────────────────────────────────────
+# ─── Combined Run Forever Task ───────────────────────────────────────────
 async def run_forever():
     delay = 1
     while True:
@@ -96,8 +104,15 @@ async def run_forever():
         else:
             delay = 1
 
-# ─── Main Entrypoint ──────────────────────────────────────────
+# ─── Start FastAPI & Monitoring ──────────────────────────────────────────
+def start_fastapi():
+    port = int(os.getenv("PORT", 8000))
+    uvicorn.run(app, host="0.0.0.0", port=port)
+
 if __name__ == "__main__":
+    # Start web service for deployment
+    threading.Thread(target=start_fastapi, daemon=True).start()
+    # Start monitoring loop
     print(f"[{timestamp()}] 🔌 Starting USDC Outflow Monitor…")
     asyncio.run(run_forever())
     
