@@ -123,14 +123,25 @@ async def listen_usdc():
 
 # ─── RPC: get owner of token account ──────────────────────────────────────
 async def get_owner_of_token_account(token_acc):
-    body = {"jsonrpc":"2.0","id":1,
-            "method":"getAccountInfo",
-            "params":[token_acc,{"encoding":"jsonParsed"}]}
+    body = {
+        "jsonrpc": "2.0",
+        "id": 1,
+        "method": "getAccountInfo",
+        "params": [
+            token_acc,
+            {"encoding": "jsonParsed"}
+        ]
+    }
     r = requests.post(RPC_HTTP, json=body).json()
-    return r.get("result", {}).get("value", {}).get("data", {}).get("parsed", {})
-            .get("info", {}).get("owner")
+    # Safely navigate JSON structure
+    result = r.get("result", {})
+    value = result.get("value", {})
+    data = value.get("data", {})
+    parsed = data.get("parsed", {})
+    info = parsed.get("info", {})
+    return info.get("owner")
 
-# ─── Subscribe to logs for SPL buys ───────────────────────────────────────
+# ─── Subscribe to logs for SPL buys ─────────────────────────────────────── for SPL buys ───────────────────────────────────────
 async def subscribe_logs_for(wallet):
     global logs_ws
     if not logs_ws or not logs_ws.open:
@@ -189,4 +200,4 @@ if __name__=="__main__":
     threading.Thread(target=start_fastapi, daemon=True).start()
     print(f"[{timestamp()}] Bot starting…")
     asyncio.run(run_forever())
-            
+    
