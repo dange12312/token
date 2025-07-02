@@ -71,10 +71,23 @@ async def listen_transactions():
             params = msg["params"]
             sub_id = params["subscription"]
             wallet = subs.get(sub_id)
-            info = params["result"]["value"]["data"]["parsed"]["info"]
-            amount = int(info.get("tokenAmount", {}).get("amount", 0))
 
-            if balances[wallet] is None:
+            result = params.get("result", {})
+            value = result.get("value", {})
+            data_field = value.get("data")
+
+            # Skip if data not in expected parsed format
+            if not isinstance(data_field, dict):
+                continue
+
+            parsed = data_field.get("parsed", {})
+            info = parsed.get("info", {})
+            amount = 0
+            token_amount = info.get("tokenAmount")
+            if isinstance(token_amount, dict):
+                amount = int(token_amount.get("amount", 0))
+
+            if balances.get(wallet) is None:
                 balances[wallet] = amount
                 continue
 
@@ -93,14 +106,12 @@ async def listen_transactions():
 
 # ─── Combined Run Forever Task with Alerts ────────────────────────────────
 async def run_forever():
-    # Notify bot start
     notify_telegram("🤖 USDC Monitor Bot has started and is now monitoring outflows.")
     delay = 1
     while True:
         try:
             await listen_transactions()
         except Exception as err:
-            # Notify bot error/stop
             notify_telegram(f"⚠️ USDC Monitor Bot encountered an error and stopped: {err}")
             print(f"[{timestamp()}] 🔁 Error: {err} — retrying in {delay}s")
             await asyncio.sleep(delay)
@@ -114,9 +125,7 @@ def start_fastapi():
     uvicorn.run(app, host="0.0.0.0", port=port)
 
 if __name__ == "__main__":
-    # Start web service for deployment
     threading.Thread(target=start_fastapi, daemon=True).start()
-    # Start monitoring loop
     print(f"[{timestamp()}] 🔌 Starting USDC Outflow Monitor…")
     asyncio.run(run_forever())
-    
+            
