@@ -1,0 +1,10 @@
+services:
+  - type: web
+    name: token
+    env: python
+    plan: free
+    buildCommand: "pip install -r requirements.txt"
+    startCommand: "python your_script_name.py"
+    envVars:
+      - key: PORT
+        value: 10000  # Render will override this automatically
