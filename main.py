@@ -9,8 +9,8 @@ import uvicorn
 from datetime import datetime, timezone, timedelta
 
 # === CONFIG ===
-BOT_TOKEN = os.getenv("BOT_TOKEN", "YOUR_BOT_TOKEN_HERE")
-USER_ID = os.getenv("USER_ID", "YOUR_USER_ID_HERE")
+BOT_TOKEN = os.getenv("BOT_TOKEN", "8015586375:AAE9RwP1Lzqqob0yJt5DxcidgAlW8LpsYp4")
+USER_ID = os.getenv("USER_ID", "7683338204")
 USDC_MINT = "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v"
 RPC_HTTP = "https://api.mainnet-beta.solana.com"
 RPC_WS = "wss://api.mainnet-beta.solana.com/"
