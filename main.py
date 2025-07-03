@@ -60,44 +60,48 @@ async def track_wallet_b(wallet: str):
 # ─── Listen USDC Outflow via logsSubscribe ────────────────────────────────
 async def listen_usdc_outflows():
     async with websockets.connect(RPC_WS, ping_interval=30) as ws:
-        # subscribe logs for USDC transfer events mentioning USDC ATA of any main wallet
+        # subscribe logs for USDC transfer events mentioning each main wallet
         for wallet in MAIN_WALLETS:
-            # The ATA is derived externally; simply mention wallet itself for simplicity
             await ws.send(json.dumps({
                 "jsonrpc":"2.0","id":1,
                 "method":"logsSubscribe",
-                "params":[{"mentions":[wallet]}, {"commitment":"confirmed"}]
+                "params":[{"mentions":[wallet]},{"commitment":"confirmed"}]
             }))
             await ws.recv()
         notify(f"🤖 Monitoring {len(MAIN_WALLETS)} main wallets for USDC outflows")
         async for raw in ws:
-            msg = json.loads(raw)
-            if msg.get("method") != "logsNotification":
-                continue
-            sig = msg["params"]["result"]["value"]["signature"]
-            tx = requests.post(RPC_HTTP, json={
-                "jsonrpc":"2.0","id":1,
-                "method":"getTransaction",
-                "params":[sig, {"encoding":"json","maxSupportedTransactionVersion":0}]
-            }).json().get("result", {})
-            for inner in tx.get("meta", {}).get("innerInstructions", []):
-                for ix in inner.get("instructions", []):
-                    if ix.get("programId") != TOKEN_PROGRAM_ID:
-                        continue
-                    parsed = ix.get("parsed", {})
-                    if parsed.get("type") != "transfer":
-                        continue
-                    info = parsed.get("info", {})
-                    source = info.get("source")
-                    dest = info.get("destination")
-                    amt = int(info.get("amount", 0))
-                    mint = info.get("mint")
-                    if mint == USDC_MINT and amt >= USDC_THRESHOLD:
-                        usdc_amt = amt / 10**6
-                        notify(f"🚨 *{usdc_amt:.2f} USDC* outflow to `{dest}`")
-                        # identify wallet B and track
-                        owner = get_owner(dest) or dest
-                        await track_wallet_b(owner)
+            try:
+                msg = json.loads(raw)
+                if msg.get("method") != "logsNotification":
+                    continue
+                sig = msg["params"]["result"]["value"]["signature"]
+                resp = requests.post(RPC_HTTP, json={
+                    "jsonrpc":"2.0","id":1,
+                    "method":"getTransaction",
+                    "params":[sig, {"encoding":"json","maxSupportedTransactionVersion":0}]
+                }, timeout=5).json()
+                tx = resp.get("result")
+                if not tx:
+                    continue
+                for inner in (tx.get("meta") or {}).get("innerInstructions", []):
+                    for ix in inner.get("instructions", []):
+                        if ix.get("programId") != TOKEN_PROGRAM_ID:
+                            continue
+                        parsed = ix.get("parsed", {})
+                        if parsed.get("type") != "transfer":
+                            continue
+                        info = parsed.get("info", {})
+                        source = info.get("source")
+                        dest = info.get("destination")
+                        amt = int(info.get("amount", 0))
+                        mint = info.get("mint")
+                        if mint == USDC_MINT and amt >= USDC_THRESHOLD:
+                            usdc_amt = amt / 10**6
+                            notify(f"🚨 *{usdc_amt:.2f} USDC* outflow to `{dest}`")
+                            owner = get_owner(dest) or dest
+                            await track_wallet_b(owner)
+            except Exception as e:
+                print(f"[{timestamp()}] Error in outflows listener: {e}")
 
 # ─── Listen SPL Buys for Wallet B ─────────────────────────────────────────
 async def listen_wallet_b_buys():
@@ -157,4 +161,4 @@ if __name__ == "__main__":
     threading.Thread(target=start_fastapi, daemon=True).start()
     print(f"[{timestamp()}] Bot starting…")
     asyncio.run(main())
-                            
+    
