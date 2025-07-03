@@ -85,8 +85,7 @@ async def monitor_wallet_b(wallet):
                     mint = parsed.get("data", {}).get("parsed", {}).get("info", {}).get("mint")
                     if mint and mint not in seen_tokens and mint != USDC_MINT:
                         seen_tokens.add(mint)
-                        notify_telegram(f"🎯 *New Token Acquired:*
-[Copy Contract](https://solscan.io/token/{mint})")
+                        notify_telegram(f"🎯 *New Token Acquired:* [Copy Contract](https://solscan.io/token/{mint})")")
                         break
         except Exception as e:
             print(f"[{timestamp()}] Wallet B error: {e}")
@@ -148,4 +147,4 @@ if __name__ == "__main__":
     threading.Thread(target=start_fastapi, daemon=True).start()
     print(f"[{timestamp()}] Starting monitor...")
     asyncio.run(run_forever())
-    
+        
