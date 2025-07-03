@@ -3,148 +3,158 @@ import json
 import asyncio
 import requests
 import websockets
-import threading
-from datetime import datetime, timezone
+from datetime import datetime, timezone, timedelta
 from fastapi import FastAPI
 import uvicorn
+import threading
 
-# Configuration
-BOT_TOKEN = "8015586375:AAE9RwP1Lzqqob0yJt5DxcidgAlW8LpsYp4"
-USER_ID = "7683338204"
-WALLETS = [
+# ─── Configuration ──────────────────────────────────────────────────────
+BOT_TOKEN = os.getenv("BOT_TOKEN", "8015586375:AAE9RwP1Lzqqob0yJt5DxcidgAlW8LpsYp4")
+USER_ID = os.getenv("USER_ID", "7683338204")
+RPC_WS = "wss://api.mainnet-beta.solana.com/"
+RPC_HTTP = "https://api.mainnet-beta.solana.com"
+USDC_MINT = "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v"
+TOKEN_PROGRAM_ID = "TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA"
+USDC_THRESHOLD = 100 * 10**6  # 100 USDC
+WINDOW_MINUTES = 5
+MAIN_WALLETS = [
     "dUJNHh9Nm9rsn7ykTViG7N7BJuaoJJD9H635B8BVifa",
     "9B1fR2Z38ggjqmFuhYBEsa7fXaBR1dkC7BamixjmWZb4"
 ]
-USDC_MINT = "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v"
-THRESHOLD = int(100 * 1e6)
-RPC_WS = "wss://api.mainnet-beta.solana.com/"
 
-# Globals
-subs = {}
-balances = {}
-seen_tokens = set()
-watching_wallets = {}
+# ─── State ───────────────────────────────────────────────────────────────
+watched_wallets = {}       # pubkey -> expiry datetime
+seen_tokens = set()        # dedupe new token CAs
 
+# ─── FastAPI ─────────────────────────────────────────────────────────────
 app = FastAPI()
-
 @app.get("/")
-async def root():
+def root():
     return {"status": "ok"}
 
+# ─── Helpers ─────────────────────────────────────────────────────────────
 def timestamp():
     return datetime.now(timezone.utc).isoformat()
 
-def notify_telegram(message):
-    url = f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage"
-    res = requests.post(url, data={"chat_id": USER_ID, "text": message, "parse_mode": "Markdown"})
-    print("Telegram response:", res.status_code, res.text)
+def notify(msg: str):
+    requests.post(
+        f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage",
+        data={"chat_id": USER_ID, "text": msg, "parse_mode": "Markdown"}
+    )
 
-async def subscribe_wallets(ws):
-    for i, wallet in enumerate(WALLETS, 1):
-        ata = await get_usdc_ata(wallet)
-        req = {
-            "jsonrpc": "2.0",
-            "id": i,
-            "method": "accountSubscribe",
-            "params": [ata, {"encoding": "jsonParsed", "commitment": "confirmed"}]
-        }
-        await ws.send(json.dumps(req))
-        resp = json.loads(await ws.recv())
-        sub_id = resp.get("result")
-        subs[sub_id] = ata
-        balances[ata] = None
+def get_owner(ata: str) -> str:
+    body = {"jsonrpc":"2.0","id":1,"method":"getAccountInfo","params":[ata,{"encoding":"jsonParsed"}]}
+    try:
+        resp = requests.post(RPC_HTTP, json=body, timeout=5).json()
+        return resp.get("result", {}).get("value", {}).get("data", {}).get("parsed", {}).get("info", {}).get("owner")
+    except:
+        return None
 
-async def get_usdc_ata(wallet):
-    from base58 import b58decode
-    import hashlib
-    seed = bytes(wallet, 'utf-8') + bytes(USDC_MINT, 'utf-8') + b"TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA"
-    return hashlib.sha256(seed).hexdigest()[:32]  # Placeholder: Replace with actual PDA calculation
-
-async def monitor_wallet_b(wallet):
-    if wallet in watching_wallets:
+# ─── Track Wallet B ──────────────────────────────────────────────────────
+async def track_wallet_b(wallet: str):
+    if wallet in watched_wallets:
         return
-    watching_wallets[wallet] = True
+    watched_wallets[wallet] = datetime.now(timezone.utc) + timedelta(minutes=WINDOW_MINUTES)
+    notify(f"🔔 Now watching `{wallet}` for token buys (next {WINDOW_MINUTES} min)")
 
-    async def monitor():
-        try:
-            req = {
-                "jsonrpc": "2.0",
-                "id": 1,
-                "method": "accountSubscribe",
-                "params": [wallet, {"encoding": "jsonParsed", "commitment": "confirmed"}]
-            }
-            async with websockets.connect(RPC_WS) as ws:
-                await ws.send(json.dumps(req))
-                while True:
-                    raw = await asyncio.wait_for(ws.recv(), timeout=300)
-                    msg = json.loads(raw)
-                    if msg.get("method") != "accountNotification":
-                        continue
-                    parsed = msg["params"]["result"]["value"]
-                    tokens = parsed.get("data", {}).get("parsed", {}).get("info", {}).get("tokenAmount", {})
-                    mint = parsed.get("data", {}).get("parsed", {}).get("info", {}).get("mint")
-                    if mint and mint not in seen_tokens and mint != USDC_MINT:
-                        seen_tokens.add(mint)
-                        notify_telegram(f"🎯 *New Token Acquired:* [Copy Contract](https://solscan.io/token/{mint})")")
-                        break
-        except Exception as e:
-            print(f"[{timestamp()}] Wallet B error: {e}")
-        finally:
-            watching_wallets.pop(wallet, None)
-
-    asyncio.create_task(monitor())
-
-async def listen_transactions():
+# ─── Listen USDC Outflow via logsSubscribe ────────────────────────────────
+async def listen_usdc_outflows():
     async with websockets.connect(RPC_WS, ping_interval=30) as ws:
-        await subscribe_wallets(ws)
-        notify_telegram("🤖 Bot started. Monitoring USDC outflows.")
-
+        # subscribe logs for USDC transfer events mentioning USDC ATA of any main wallet
+        for wallet in MAIN_WALLETS:
+            # The ATA is derived externally; simply mention wallet itself for simplicity
+            await ws.send(json.dumps({
+                "jsonrpc":"2.0","id":1,
+                "method":"logsSubscribe",
+                "params":[{"mentions":[wallet]}, {"commitment":"confirmed"}]
+            }))
+            await ws.recv()
+        notify(f"🤖 Monitoring {len(MAIN_WALLETS)} main wallets for USDC outflows")
         async for raw in ws:
             msg = json.loads(raw)
-            if msg.get("method") != "accountNotification":
+            if msg.get("method") != "logsNotification":
                 continue
+            sig = msg["params"]["result"]["value"]["signature"]
+            tx = requests.post(RPC_HTTP, json={
+                "jsonrpc":"2.0","id":1,
+                "method":"getTransaction",
+                "params":[sig, {"encoding":"json","maxSupportedTransactionVersion":0}]
+            }).json().get("result", {})
+            for inner in tx.get("meta", {}).get("innerInstructions", []):
+                for ix in inner.get("instructions", []):
+                    if ix.get("programId") != TOKEN_PROGRAM_ID:
+                        continue
+                    parsed = ix.get("parsed", {})
+                    if parsed.get("type") != "transfer":
+                        continue
+                    info = parsed.get("info", {})
+                    source = info.get("source")
+                    dest = info.get("destination")
+                    amt = int(info.get("amount", 0))
+                    mint = info.get("mint")
+                    if mint == USDC_MINT and amt >= USDC_THRESHOLD:
+                        usdc_amt = amt / 10**6
+                        notify(f"🚨 *{usdc_amt:.2f} USDC* outflow to `{dest}`")
+                        # identify wallet B and track
+                        owner = get_owner(dest) or dest
+                        await track_wallet_b(owner)
 
-            params = msg["params"]
-            sub_id = params["subscription"]
-            ata = subs.get(sub_id)
-            info = params["result"]["value"]["data"]["parsed"]["info"]
-            amount = int(info.get("tokenAmount", {}).get("amount", 0))
+# ─── Listen SPL Buys for Wallet B ─────────────────────────────────────────
+async def listen_wallet_b_buys():
+    async with websockets.connect(RPC_WS, ping_interval=30) as ws:
+        # initially subscribe logs for any future wallet B
+        while True:
+            await asyncio.sleep(1)
+            now = datetime.now(timezone.utc)
+            to_remove = []
+            # subscribe logs and handle buys
+            for wallet, expiry in watched_wallets.items():
+                if now > expiry:
+                    to_remove.append(wallet)
+                    continue
+                # check logs events
+                await ws.send(json.dumps({
+                    "jsonrpc":"2.0","id":1,
+                    "method":"logsSubscribe",
+                    "params":[{"mentions":[wallet]}, {"commitment":"confirmed"}]
+                }))
+                raw = await ws.recv()
+                msg = json.loads(raw)
+                if msg.get("method") != "logsNotification":
+                    continue
+                sig = msg["params"]["result"]["value"]["signature"]
+                tx = requests.post(RPC_HTTP, json={
+                    "jsonrpc":"2.0","id":1,
+                    "method":"getTransaction",
+                    "params":[sig, {"encoding":"json","maxSupportedTransactionVersion":0}]
+                }).json().get("result", {})
+                for inner in tx.get("meta", {}).get("innerInstructions", []):
+                    for ix in inner.get("instructions", []):
+                        if ix.get("programId") != TOKEN_PROGRAM_ID:
+                            continue
+                        parsed = ix.get("parsed", {})
+                        if parsed.get("type") != "transfer":
+                            continue
+                        info = parsed.get("info", {})
+                        mint = info.get("mint")
+                        owner_dest = get_owner(info.get("destination")) or info.get("destination")
+                        if (mint and mint != USDC_MINT and mint not in seen_tokens and owner_dest == wallet):
+                            seen_tokens.add(mint)
+                            notify(f"✨ New token acquired! [`{mint}`](https://solscan.io/token/{mint}) by `{wallet}`")
+            for w in to_remove:
+                watched_wallets.pop(w, None)
+                notify(f"🔕 Stopped watching `{w}` after window expired.")
 
-            if balances[ata] is None:
-                balances[ata] = amount
-                continue
+# ─── Main Runner ─────────────────────────────────────────────────────────
+async def main():
+    await asyncio.gather(listen_usdc_outflows(), listen_wallet_b_buys())
 
-            diff = amount - balances[ata]
-            balances[ata] = amount
-
-            if diff < 0 and abs(diff) >= THRESHOLD:
-                from_wallet = ata
-                outflow = abs(diff) / 1e6
-                notify_telegram(f"🚨 *{outflow:.2f} USDC* sent from `{from_wallet}`")
-
-                # Simulate receiver wallet B
-                wallet_b = info.get("owner")
-                if wallet_b:
-                    await monitor_wallet_b(wallet_b)
-
-async def run_forever():
-    delay = 1
-    while True:
-        try:
-            await listen_transactions()
-        except Exception as err:
-            notify_telegram(f"⚠️ Bot error: {err}")
-            await asyncio.sleep(delay)
-            delay = min(delay * 2, 60)
-        else:
-            delay = 1
-
+# ─── Deploy ──────────────────────────────────────────────────────────────
 def start_fastapi():
-    port = int(os.getenv("PORT", 8000))
-    uvicorn.run(app, host="0.0.0.0", port=port)
+    uvicorn.run(app, host="0.0.0.0", port=int(os.getenv("PORT", 8000)))
 
 if __name__ == "__main__":
     threading.Thread(target=start_fastapi, daemon=True).start()
-    print(f"[{timestamp()}] Starting monitor...")
-    asyncio.run(run_forever())
-        
+    print(f"[{timestamp()}] Bot starting…")
+    asyncio.run(main())
+                            
