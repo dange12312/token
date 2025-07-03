@@ -8,200 +8,180 @@ from fastapi import FastAPI
 import uvicorn
 from datetime import datetime, timezone, timedelta
 
-# ─── Configuration ─────────────────────────────────────────────────────
-BOT_TOKEN = os.getenv("BOT_TOKEN", "8015586375:AAE9RwP1Lzqqob0yJt5DxcidgAlW8LpsYp4")
-USER_ID = os.getenv("USER_ID", "7683338204")
+# === CONFIG ===
+BOT_TOKEN = os.getenv("BOT_TOKEN", "YOUR_BOT_TOKEN")
+USER_ID = os.getenv("USER_ID", "YOUR_USER_ID")
 USDC_MINT = "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v"
 RPC_HTTP = "https://api.mainnet-beta.solana.com"
 RPC_WS = "wss://api.mainnet-beta.solana.com/"
 THRESHOLD = int(100 * 1e6)  # 100 USDC
 WINDOW_MINUTES = 5
 
-# ─── Wallets to Monitor ────────────────────────────────────────────────
-WALLETS = [
-    "dUJNHh9Nm9rsn7ykTViG7N7BJuaoJJD9H635B8BVifa",
-    "9B1fR2Z38ggjqmFuhYBEsa7fXaBR1dkC7BamixjmWZb4"
+# === MONITORED MAIN WALLETS ===
+MAIN_WALLETS = [
+    "8pV7xKJfyudYM8bLWMAEgB4xiit5g3qh7uVihBFh233e",
+    # Add more if needed
 ]
 
-# ─── Globals ───────────────────────────────────────────────────────────
+# === STATE ===
 token_accounts = []
-subs_usdc = {}            # subscription id → token account
-balances = {}            # token account → last balance
-logs_sub = {}            # wallet → log subscription id
-watched_wallets = {}     # wallet → expiry datetime
-seen_token_mints = set()
+balances = {}
+subs_usdc = {}  # sub ID -> token account
+watched_wallets = {}  # wallet -> valid until
+logs_sub = {}  # wallet -> sub ID
+seen_mints = set()
 logs_ws = None
 
-# ─── FastAPI App ───────────────────────────────────────────────────────
+# === FASTAPI ===
 app = FastAPI()
 
 @app.get("/")
 async def root():
-    return {"status": "ok"}
+    return {"status": "running"}
 
-# ─── Utilities ─────────────────────────────────────────────────────────
+# === TELEGRAM ALERT ===
+def notify(msg):
+    requests.post(
+        f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage",
+        data={"chat_id": USER_ID, "text": msg, "parse_mode": "Markdown"}
+    )
+
+# === HELPER ===
 def timestamp():
     return datetime.now(timezone.utc).isoformat()
 
-def notify(msg):
-    try:
-        requests.post(
-            f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage",
-            data={"chat_id": USER_ID, "text": msg, "parse_mode": "Markdown"}
-        )
-    except Exception as e:
-        print(f"[Telegram Error] {e}")
-
-# ─── Get USDC Token Accounts ───────────────────────────────────────────
-async def get_usdc_token_accounts():
-    for wallet in WALLETS:
-        payload = {
-            "jsonrpc": "2.0",
-            "id": 1,
-            "method": "getTokenAccountsByOwner",
+# === INIT USDC ACCOUNTS ===
+async def get_usdc_atas():
+    for wallet in MAIN_WALLETS:
+        body = {
+            "jsonrpc": "2.0", "id": 1, "method": "getTokenAccountsByOwner",
             "params": [wallet, {"mint": USDC_MINT}, {"encoding": "jsonParsed"}]
         }
-        resp = requests.post(RPC_HTTP, json=payload).json()
-        for acc in resp.get("result", {}).get("value", []):
+        r = requests.post(RPC_HTTP, json=body).json()
+        for acc in r.get("result", {}).get("value", []):
             ata = acc.get("pubkey")
             if ata and ata not in token_accounts:
                 token_accounts.append(ata)
                 balances[ata] = None
 
-# ─── Get Owner of Token Account ────────────────────────────────────────
-async def get_owner_of_token_account(token_account):
-    payload = {
-        "jsonrpc": "2.0",
-        "id": 1,
-        "method": "getAccountInfo",
+# === GET OWNER OF TOKEN ACCOUNT ===
+async def get_owner(token_account):
+    body = {
+        "jsonrpc": "2.0", "id": 1, "method": "getAccountInfo",
         "params": [token_account, {"encoding": "jsonParsed"}]
     }
-    resp = requests.post(RPC_HTTP, json=payload).json()
-    return resp.get("result", {}).get("value", {}).get("data", {}).get("parsed", {}).get("info", {}).get("owner")
+    r = requests.post(RPC_HTTP, json=body).json()
+    return r.get("result", {}).get("value", {}).get("data", {}).get("parsed", {}).get("info", {}).get("owner")
 
-# ─── Cleanup Wallet B ──────────────────────────────────────────────────
-async def cleanup_wallet(wallet):
+# === USDC ACCOUNT SUBSCRIBE ===
+async def subscribe_usdc(ws):
+    for i, acc in enumerate(token_accounts, 1):
+        req = {
+            "jsonrpc": "2.0", "id": i, "method": "accountSubscribe",
+            "params": [acc, {"encoding": "jsonParsed", "commitment": "confirmed"}]
+        }
+        await ws.send(json.dumps(req))
+        res = json.loads(await ws.recv())
+        subs_usdc[res.get("result")] = acc
+
+# === CLEANUP ===
+async def cleanup(wallet):
     await asyncio.sleep(WINDOW_MINUTES * 60)
     sub_id = logs_sub.get(wallet)
     if sub_id and logs_ws and logs_ws.open:
         await logs_ws.send(json.dumps({
-            "jsonrpc": "2.0",
-            "id": sub_id,
-            "method": "logsUnsubscribe",
-            "params": [sub_id]
+            "jsonrpc": "2.0", "id": sub_id,
+            "method": "logsUnsubscribe", "params": [sub_id]
         }))
         logs_sub.pop(wallet, None)
     watched_wallets.pop(wallet, None)
-    notify(f"🔕 Stopped watching `{wallet}` after {WINDOW_MINUTES} minutes.")
+    notify(f"🔕 Stopped watching `{wallet}`.")
 
-# ─── Subscribe Logs for Wallet ─────────────────────────────────────────
-async def subscribe_logs(wallet):
+# === INSPECT TRANSACTION ===
+async def inspect_tx(signature):
+    body = {
+        "jsonrpc": "2.0", "id": 1, "method": "getTransaction",
+        "params": [signature, {"encoding": "json"}]
+    }
+    r = requests.post(RPC_HTTP, json=body).json()
+    tx = r.get("result", {})
+    post_balances = tx.get("meta", {}).get("postTokenBalances", [])
+    now = datetime.now(timezone.utc)
+    for bal in post_balances:
+        mint = bal.get("mint")
+        owner = bal.get("owner")
+        if mint != USDC_MINT and mint not in seen_mints and owner in watched_wallets:
+            if watched_wallets[owner] >= now:
+                seen_mints.add(mint)
+                notify(
+                    f"🎯 *New Token Acquired:* [Copy Contract](https://solscan.io/token/{mint}) by `{owner}`"
+                )
+
+# === LOGS SUBSCRIBE ===
+async def subscribe_logs_for(wallet):
     global logs_ws
     if not logs_ws or not logs_ws.open:
         logs_ws = await websockets.connect(RPC_WS, ping_interval=30)
-
     sub_id = len(logs_sub) + 100
-    payload = {
-        "jsonrpc": "2.0",
-        "id": sub_id,
-        "method": "logsSubscribe",
+    req = {
+        "jsonrpc": "2.0", "id": sub_id, "method": "logsSubscribe",
         "params": [{"mentions": [wallet]}, {"commitment": "confirmed"}]
     }
-    await logs_ws.send(json.dumps(payload))
+    await logs_ws.send(json.dumps(req))
     res = json.loads(await logs_ws.recv())
     logs_sub[wallet] = res.get("result")
-    watched_wallets[wallet] = datetime.now(timezone.utc) + timedelta(minutes=WINDOW_MINUTES)
-    asyncio.create_task(cleanup_wallet(wallet))
-    notify(f"👀 Watching `{wallet}` for token buys for {WINDOW_MINUTES} min.")
 
-# ─── Listen to USDC Token Account ──────────────────────────────────────
-async def listen_usdc():
-    async with websockets.connect(RPC_WS, ping_interval=30) as ws:
-        for i, ata in enumerate(token_accounts):
-            payload = {
-                "jsonrpc": "2.0",
-                "id": i + 1,
-                "method": "accountSubscribe",
-                "params": [ata, {"encoding": "jsonParsed", "commitment": "confirmed"}]
-            }
-            await ws.send(json.dumps(payload))
-            res = json.loads(await ws.recv())
-            subs_usdc[res.get("result")] = ata
-
-        notify(f"🤖 Monitoring {len(token_accounts)} USDC accounts.")
-
-        async for raw in ws:
-            msg = json.loads(raw)
-            if msg.get("method") != "accountNotification":
-                continue
-
-            params = msg["params"]
-            ata = subs_usdc.get(params.get("subscription"))
-            info = params.get("result", {}).get("value", {}).get("data", {}).get("parsed", {}).get("info", {})
-            amt = int(info.get("tokenAmount", {}).get("amount", 0))
-
-            if balances[ata] is None:
-                balances[ata] = amt
-                continue
-
-            diff = amt - balances[ata]
-            balances[ata] = amt
-
-            if diff < 0 and abs(diff) >= THRESHOLD:
-                owner = await get_owner_of_token_account(info.get("destination") or info.get("to"))
-                if owner and owner not in logs_sub:
-                    await subscribe_logs(owner)
-                notify(f"🚨 *{abs(diff)/1e6:.2f} USDC* sent from `{ata}`")
-
-# ─── Inspect SPL Token Buys ────────────────────────────────────────────
-async def inspect_transaction(sig):
-    payload = {
-        "jsonrpc": "2.0",
-        "id": 1,
-        "method": "getTransaction",
-        "params": [sig, {"encoding": "json", "maxSupportedTransactionVersion": 0}]
-    }
-    resp = requests.post(RPC_HTTP, json=payload).json()
-    tx = resp.get("result", {})
-
-    now = datetime.now(timezone.utc)
-    for inner in tx.get("meta", {}).get("innerInstructions", []):
-        for ix in inner.get("instructions", []):
-            if ix.get("program") != "spl-token":
-                continue
-            parsed = ix.get("parsed", {})
-            mint = parsed.get("info", {}).get("mint")
-            dest = parsed.get("info", {}).get("to")
-            if not mint or mint == USDC_MINT or mint in seen_token_mints:
-                continue
-            if dest in watched_wallets and watched_wallets[dest] >= now:
-                seen_token_mints.add(mint)
-                notify(f"🎯 *New Token Acquired:* [Copy Contract](https://solscan.io/token/{mint})")
-
-# ─── Listen to Logs for SPL Token Buys ─────────────────────────────────
+# === LOG LISTENER ===
 async def listen_logs():
     global logs_ws
-    if not logs_ws or not logs_ws.open:
-        logs_ws = await websockets.connect(RPC_WS, ping_interval=30)
-
+    logs_ws = await websockets.connect(RPC_WS, ping_interval=30)
     async for raw in logs_ws:
         msg = json.loads(raw)
         if msg.get("method") != "logsNotification":
             continue
         sig = msg.get("params", {}).get("result", {}).get("value", {}).get("signature")
         if sig:
-            asyncio.create_task(inspect_transaction(sig))
+            asyncio.create_task(inspect_tx(sig))
 
-# ─── Run Bot Forever ───────────────────────────────────────────────────
-async def run_bot():
-    await get_usdc_token_accounts()
+# === USDC MONITOR ===
+async def listen_usdc():
+    async with websockets.connect(RPC_WS, ping_interval=30) as ws:
+        await subscribe_usdc(ws)
+        notify(f"🤖 Monitoring {len(token_accounts)} USDC accounts.")
+        async for raw in ws:
+            msg = json.loads(raw)
+            if msg.get("method") != "accountNotification":
+                continue
+            sub_id = msg["params"]["subscription"]
+            acc = subs_usdc.get(sub_id)
+            info = msg["params"]["result"]["value"]["data"]["parsed"]["info"]
+            amt = int(info.get("tokenAmount", {}).get("amount", 0))
+            if balances[acc] is None:
+                balances[acc] = amt
+                continue
+            diff = amt - balances[acc]
+            balances[acc] = amt
+            if diff < 0 and abs(diff) >= THRESHOLD:
+                usdc_out = abs(diff) / 1e6
+                to_acc = info.get("destination") or info.get("to")
+                owner = await get_owner(to_acc)
+                notify(f"🚨 {usdc_out:.2f} USDC sent from `{acc}`")
+                if owner and owner not in watched_wallets:
+                    await subscribe_logs_for(owner)
+                    watched_wallets[owner] = datetime.now(timezone.utc) + timedelta(minutes=WINDOW_MINUTES)
+                    asyncio.create_task(cleanup(owner))
+                    notify(f"🔔 Watching `{owner}` for SPL token buys")
+
+# === MAIN RUNNER ===
+async def main():
+    await get_usdc_atas()
     await asyncio.gather(listen_usdc(), listen_logs())
 
-# ─── Start FastAPI Server ──────────────────────────────────────────────
-def start_web():
+def start_fastapi():
     uvicorn.run(app, host="0.0.0.0", port=int(os.getenv("PORT", 8000)))
 
 if __name__ == "__main__":
-    threading.Thread(target=start_web, daemon=True).start()
-    asyncio.run(run_bot())
+    threading.Thread(target=start_fastapi, daemon=True).start()
+    print(f"[{timestamp()}] Bot starting...")
+    asyncio.run(main())
     
