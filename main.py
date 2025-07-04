@@ -1,148 +1,164 @@
-import os
 import json
 import asyncio
 import requests
 import websockets
 import threading
+import os
 from fastapi import FastAPI
 import uvicorn
 from datetime import datetime, timezone, timedelta
 
-# ─── Configuration ─────────────────────────────────────────
+# === CONFIG ===
 BOT_TOKEN = os.getenv("BOT_TOKEN", "8015586375:AAE9RwP1Lzqqob0yJt5DxcidgAlW8LpsYp4")
-CHAT_ID = os.getenv("CHAT_ID", "7683338204")
+USER_ID = os.getenv("USER_ID", "7683338204")
+USDC_MINT = "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v"
 RPC_HTTP = "https://api.mainnet-beta.solana.com"
 RPC_WS = "wss://api.mainnet-beta.solana.com/"
-USDC_MINT = "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v"
+THRESHOLD = int(100 * 1e6)  # 100 USDC
+WINDOW_MINUTES = 5
+
+# === MONITORED MAIN WALLETS ===
 MAIN_WALLETS = [
-    "8pV7xKJfyudYM8bLWMAEgB4xiit5g3qh7uVihBFh233e",
-    "dUJNHh9Nm9rsn7ykTViG7N7BJuaoJJD9H635B8BVifa"
+    "dUJNHh9Nm9rsn7ykTViG7N7BJuaoJJD9H635B8BVifa",
+    "9B1fR2Z38ggjqmFuhYBEsa7fXaBR1dkC7BamixjmWZb4"
 ]
-OUTFLOW_THRESHOLD = 100 * 1e6  # in USDC base units
-WATCH_WINDOW = 5  # in minutes
 
-# ─── Globals ───────────────────────────────────────────────
-usdc_atas = []
-balances = {}
-seen_tokens = set()
-watching = {}
+# === STATE ===
+token_accounts = []          # USDC ATAs
+balances = {}                # ATA -> last balance
+subs_usdc = {}               # sub_id -> ATA
+watched_atas = {}            # ATA -> expiry datetime
+logs_sub = {}                # ATA -> logs sub_id
+seen_mints = set()           # dedupe mints
+logs_ws = None
+TOKEN_PROGRAM_ID = "TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA"
 
-# ─── FastAPI ───────────────────────────────────────────────
+# === FASTAPI ===
 app = FastAPI()
 @app.get("/")
-def root(): return {"status": "running"}
+async def root(): return {"status":"running"}
+
+# === UTILITIES ===
+def timestamp(): return datetime.now(timezone.utc).isoformat()
 
 def notify(msg):
     requests.post(
         f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage",
-        data={"chat_id": CHAT_ID, "text": msg, "parse_mode": "Markdown"}
+        data={"chat_id": USER_ID, "text": msg, "parse_mode": "Markdown"}
     )
 
-# ─── Utilities ─────────────────────────────────────────────
-def timestamp():
-    return datetime.now(timezone.utc).isoformat()
-
-async def get_token_accounts():
+# === INIT USDC ATAs ===
+async def get_usdc_atas():
     for wallet in MAIN_WALLETS:
-        body = {
-            "jsonrpc": "2.0", "id": 1, "method": "getTokenAccountsByOwner",
-            "params": [wallet, {"mint": USDC_MINT}, {"encoding": "jsonParsed"}]
-        }
-        r = requests.post(RPC_HTTP, json=body).json()
-        for acc in r.get("result", {}).get("value", []):
-            pubkey = acc.get("pubkey")
-            if pubkey and pubkey not in usdc_atas:
-                usdc_atas.append(pubkey)
-                balances[pubkey] = None
+        payload = {"jsonrpc":"2.0","id":1,"method":"getTokenAccountsByOwner",
+                   "params":[wallet,{"mint":USDC_MINT},{"encoding":"jsonParsed"}]}
+        r = requests.post(RPC_HTTP, json=payload).json()
+        for acc in r.get("result",{}).get("value",[]):
+            ata = acc.get("pubkey")
+            if ata and ata not in token_accounts:
+                token_accounts.append(ata)
+                balances[ata] = None
+    notify(f"🤖 Monitoring {len(token_accounts)} USDC ATAs.")
+    print(f"[{timestamp()}] ATAs: {token_accounts}")
 
-async def subscribe_atas(ws):
-    for idx, ata in enumerate(usdc_atas, start=1):
-        sub_msg = {
-            "jsonrpc": "2.0", "id": idx,
-            "method": "accountSubscribe",
-            "params": [ata, {"encoding": "jsonParsed", "commitment": "confirmed"}]
-        }
-        await ws.send(json.dumps(sub_msg))
-
-async def get_owner(account):
-    body = {
-        "jsonrpc": "2.0", "id": 1, "method": "getAccountInfo",
-        "params": [account, {"encoding": "jsonParsed"}]
-    }
-    r = requests.post(RPC_HTTP, json=body).json()
-    return (r.get("result") or {}).get("value", {}).get("data", {}).get("parsed", {}).get("info", {}).get("owner")
-
-async def monitor_outflows():
-    async with websockets.connect(RPC_WS) as ws:
-        await subscribe_atas(ws)
-        notify(f"🤖 Monitoring {len(usdc_atas)} USDC ATAs.")
-        while True:
-            raw = await ws.recv()
-            msg = json.loads(raw)
-            if msg.get("method") != "accountNotification": continue
-            acc = msg["params"]["result"]["context"]["slot"]
-            val = msg["params"]["result"]["value"]
-            ata = msg["params"]["subscription"]  # index based
-            parsed = val.get("data", {}).get("parsed", {})
-            info = parsed.get("info", {})
-            amount = int(info.get("tokenAmount", {}).get("amount", 0))
-            token_acc = msg["params"]["subscription"]
-            if balances[token_acc] is None:
-                balances[token_acc] = amount
-                continue
-            diff = amount - balances[token_acc]
-            balances[token_acc] = amount
-
-            # Only track significant outflows
-            if diff < 0 and abs(diff) >= OUTFLOW_THRESHOLD:
-                dest = info.get("destination") or info.get("to")
-                main_owner = await get_owner(token_acc)
-                outflow = abs(diff) / 1e6
-                notify(f"🚨 *{outflow:.2f} USDC* outflow from `{main_owner}` to `{dest}`")
-
-                if dest:
-                    watching[dest] = datetime.now(timezone.utc) + timedelta(minutes=WATCH_WINDOW)
-
-async def monitor_logs():
-    async with websockets.connect(RPC_WS) as ws:
-        await ws.send(json.dumps({
-            "jsonrpc": "2.0", "id": 1, "method": "logsSubscribe",
-            "params": [{"mentions": list(watching)}, {"commitment": "confirmed"}]
+# === CLEANUP ATA WATCH ===
+async def cleanup_ata(ata):
+    await asyncio.sleep(WINDOW_MINUTES*60)
+    sub_id = logs_sub.pop(ata, None)
+    if sub_id and logs_ws and logs_ws.open:
+        await logs_ws.send(json.dumps({
+            "jsonrpc":"2.0","id":sub_id,
+            "method":"logsUnsubscribe","params":[sub_id]
         }))
-        while True:
-            raw = await ws.recv()
-            msg = json.loads(raw)
-            if msg.get("method") != "logsNotification": continue
-            sig = msg.get("params", {}).get("result", {}).get("value", {}).get("signature")
-            asyncio.create_task(check_transaction(sig))
+    watched_atas.pop(ata, None)
+    notify(f"🔕 Stopped watching ATA `{ata}`.")
+    print(f"[{timestamp()}] Cleaned up ATA {ata}")
 
-async def check_transaction(sig):
-    body = {
-        "jsonrpc": "2.0", "id": 1, "method": "getTransaction",
-        "params": [sig, {"encoding": "json"}]
-    }
-    r = requests.post(RPC_HTTP, json=body).json()
-    tx = r.get("result", {})
-    post_tokens = tx.get("meta", {}).get("postTokenBalances", [])
+# === INSPECT TX for new mints ===
+async def inspect_tx(sig):
+    body={"jsonrpc":"2.0","id":1,"method":"getTransaction",
+          "params":[sig,{"encoding":"json","maxSupportedTransactionVersion":0}]}
+    resp = requests.post(RPC_HTTP, json=body).json()
+    tx = resp.get("result")
+    if not tx: return
+    keys = tx.get("transaction",{}).get("message",{}).get("accountKeys",[])
+    post_bal = tx.get("meta",{}).get("postTokenBalances",[])
     now = datetime.now(timezone.utc)
-    for entry in post_tokens:
-        owner = entry.get("owner")
-        mint = entry.get("mint")
-        if mint == USDC_MINT: continue
-        if mint in seen_tokens: continue
-        if owner in watching and watching[owner] >= now:
-            seen_tokens.add(mint)
-            link = f"https://solscan.io/token/{mint}"
-            notify(f"✨ New token acquired: [`{mint}`]({link}) by `{owner}`")
+    for bal in post_bal:
+        ata = keys[bal.get("accountIndex")]
+        mint = bal.get("mint")
+        if ata in watched_atas and watched_atas[ata]>=now and mint!=USDC_MINT and mint not in seen_mints:
+            seen_mints.add(mint)
+            notify(f"🎯 *New Token Acquired:* [Click to Copy](https://solscan.io/token/{mint})")
+            print(f"[{timestamp()}] ATA {ata} acquired {mint}")
 
-async def run():
-    await get_token_accounts()
-    await asyncio.gather(monitor_outflows(), monitor_logs())
+# === SUBSCRIBE LOGS for ANY ATA ===
+async def subscribe_logs_for_ata(ata):
+    global logs_ws
+    if not logs_ws or not logs_ws.open:
+        logs_ws = await websockets.connect(RPC_WS,ping_interval=30)
+    sub_id = len(logs_sub)+100
+    payload={"jsonrpc":"2.0","id":sub_id,
+             "method":"logsSubscribe",
+             "params":[{"mentions":[ata]},{"commitment":"confirmed"}]}
+    await logs_ws.send(json.dumps(payload))
+    res=json.loads(await logs_ws.recv())
+    logs_sub[ata]=res.get("result")
+    watched_atas[ata]=datetime.now(timezone.utc)+timedelta(minutes=WINDOW_MINUTES)
+    asyncio.create_task(cleanup_ata(ata))
+    notify(f"🔔 Watching ATA `{ata}` for buys for {WINDOW_MINUTES} min.")
+    print(f"[{timestamp()}] Subscribed logs for ATA {ata}, sub_id {logs_sub[ata]}")
 
-def start_server():
-    uvicorn.run(app, host="0.0.0.0", port=int(os.getenv("PORT", 8000)))
+# === LISTEN USDC OUTFLOWS ===
+async def listen_usdc():
+    async with websockets.connect(RPC_WS,ping_interval=30) as ws:
+        # subscribe to each ATA
+        for i,ata in enumerate(token_accounts,1):
+            req={"jsonrpc":"2.0","id":i,"method":"accountSubscribe",
+                 "params":[ata,{"encoding":"jsonParsed","commitment":"confirmed"}]}
+            await ws.send(json.dumps(req))
+            res=json.loads(await ws.recv())
+            subs_usdc[res.get("result")] = ata
+            print(f"[DEBUG] Subscribed ATA {ata} sub {res.get('result')}")
+        async for raw in ws:
+            msg=json.loads(raw)
+            if msg.get("method")!="accountNotification": continue
+            print(f"[DEBUG] accountNotification: {raw}")
+            subid=msg["params"]["subscription"]
+            ata=subs_usdc.get(subid)
+            info=msg["params"]["result"]["value"]["data"]["parsed"]["info"]
+            amt=int(info.get("tokenAmount",{}).get("amount",0))
+            if balances[ata] is None:
+                balances[ata]=amt; continue
+            diff=amt-balances[ata]; balances[ata]=amt
+            if diff<0 and abs(diff)>=THRESHOLD:
+                out=abs(diff)/1e6
+                dest=info.get("destination") or info.get("to")
+                notify(f"🚨 *{out:.2f} USDC* outflow from `{ata}` to `{dest}`")
+                print(f"[{timestamp()}] Outflow {out} from {ata} to {dest}")
+                await subscribe_logs_for_ata(dest)
 
-if __name__ == "__main__":
-    threading.Thread(target=start_server, daemon=True).start()
-    asyncio.run(run())
+# === LISTEN LOGS ===
+async def listen_logs():
+    global logs_ws
+    logs_ws=await websockets.connect(RPC_WS,ping_interval=30)
+    async for raw in logs_ws:
+        msg=json.loads(raw)
+        if msg.get("method")!="logsNotification": continue
+        sig=msg.get("params",{}).get("result",{}).get("value",{}).get("signature")
+        print(f"[DEBUG] logsNotification sig: {sig}")
+        if sig: asyncio.create_task(inspect_tx(sig))
+
+# === MAIN RUNNER ===
+async def main():
+    await get_usdc_atas()
+    await asyncio.gather(listen_usdc(), listen_logs())
+
+def start_web():
+    uvicorn.run(app,host="0.0.0.0",port=int(os.getenv("PORT",8000)))
+
+if __name__=="__main__":
+    threading.Thread(target=start_web,daemon=True).start()
+    print(f"[{timestamp()}] Bot starting...")
+    asyncio.run(main())
     
