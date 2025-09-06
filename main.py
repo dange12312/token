@@ -20,7 +20,7 @@ WINDOW_MINUTES = 5
 # === MONITORED MAIN WALLETS ===
 MAIN_WALLETS = [
     "dUJNHh9Nm9rsn7ykTViG7N7BJuaoJJD9H635B8BVifa",
-    "9B1fR2Z38ggjqmFuhYBEsa7fXaBR1dkC7BamixjmWZb4"
+    "6KK9rw7aU7HaLiHPiXHStcpSnSXuH5w7oh8Aa5ecT6Ck"
 ]
 
 # === STATE ===
